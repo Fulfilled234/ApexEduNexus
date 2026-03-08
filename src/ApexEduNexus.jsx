@@ -251,7 +251,7 @@ function GoogleLoader() {
   4. Add your Vercel URL to "Authorised JavaScript origins"
   5. Copy the Client ID and paste it below
 */
-const GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID = "839491895101-obk04d7bp6fkk1k2hoi0acfpk5im7pui.apps.googleusercontent.com";
 
 function GoogleBtn({ onSuccess, label = "Continue with Google" }) {
   const ref = useRef();

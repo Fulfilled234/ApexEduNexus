@@ -1368,17 +1368,9 @@ function SectionStreaks({ streak, setStreak, log, toast, setSection, user }) {
       toast(`Sent Study Boost! ${name}'s streak increased by 1.`);
       log("streak", `Boosted ${name}'s learning motivation`, "#10B981");
 
-      const targetedUser = board.find(b => b.id === peerId);
-      if (targetedUser) {
-        const updatedStreak = (targetedUser.streak || 0) + 1;
-        
-        await supabase
-          .from("edu_profiles")
-          .update({ streak: updatedStreak })
-          .eq("id", peerId);
+      await supabase.rpc("boost_streak", { peer_id: peerId });
 
-        fetchRealLeaderboard();
-      }
+      fetchRealLeaderboard();
     } catch (e){}
   }
 

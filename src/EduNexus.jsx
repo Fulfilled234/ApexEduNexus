@@ -1413,21 +1413,49 @@ function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePerson
             </div>
           )}
 
-          {questions.map((q, i) => (
-            <Card key={i} className="space-y-3">
-              <p className="text-sm font-bold text-gray-900"><span className="text-purple-500">Q{i + 1}.</span> {q.question}</p>
-              <div className="space-y-2">
-                {q.options.map((opt, j) => {
-                  const sel = answers[i] === opt;
-                  return (
-                    <div key={j} onClick={() => !revealed && setAnswers(p => ({ ...p, [i]: opt }))} className={`p-3 rounded-xl text-xs font-medium cursor-pointer border transition-all ${sel ? "bg-purple-50 border-purple-200 text-purple-700" : "bg-gray-50 border-gray-200 text-gray-500"}`}>
-                      {opt}
-                    </div>
-                  );
-                })}
-              </div>
-            </Card>
-          ))}
+          {questions.map((q, i) => {
+            const userAnswer = answers[i];
+            const isCorrect = userAnswer === q.answer;
+            return (
+              <Card key={i} className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm font-bold text-gray-900"><span className="text-purple-500">Q{i + 1}.</span> {q.question}</p>
+                  {revealed && (
+                    <span className={`shrink-0 text-[10px] font-black px-2 py-1 rounded-full inline-flex items-center gap-1 ${isCorrect ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-600"}`}>
+                      {isCorrect ? <><Icons.Check className="w-3 h-3" /> Correct</> : "Missed"}
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  {q.options.map((opt, j) => {
+                    const sel = userAnswer === opt;
+                    const isTheCorrectAnswer = opt === q.answer;
+
+                    // Before submitting: just show the selected option in purple, as before.
+                    // After submitting: highlight the correct answer green always, and if the
+                    // person picked a different (wrong) option, flag that selection red so
+                    // they can see exactly what they missed and what the right answer was.
+                    let style = "bg-gray-50 border-gray-200 text-gray-500";
+                    if (!revealed && sel) {
+                      style = "bg-purple-50 border-purple-200 text-purple-700";
+                    } else if (revealed && isTheCorrectAnswer) {
+                      style = "bg-emerald-50 border-emerald-300 text-emerald-700";
+                    } else if (revealed && sel && !isTheCorrectAnswer) {
+                      style = "bg-red-50 border-red-300 text-red-700";
+                    }
+
+                    return (
+                      <div key={j} onClick={() => !revealed && setAnswers(p => ({ ...p, [i]: opt }))} className={`p-3 rounded-xl text-xs font-medium cursor-pointer border transition-all flex items-center justify-between gap-2 ${style}`}>
+                        <span>{opt}</span>
+                        {revealed && isTheCorrectAnswer && <Icons.Check className="w-3.5 h-3.5 shrink-0" />}
+                        {revealed && sel && !isTheCorrectAnswer && <span className="text-xs shrink-0">✕</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </Card>
+            );
+          })}
           {!revealed && <button onClick={submitQuiz} className="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3.5 rounded-xl transition-all">Submit Answers</button>}
         </div>
       )}

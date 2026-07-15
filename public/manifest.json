@@ -1,1 +1,18 @@
 
+{
+  "name": "ApexEduNexus — Academic Command Console",
+  "short_name": "ApexEduNexus",
+  "description": "Your partner in academic excellence — deadlines, CGPA tracking, and AI-generated quizzes for Nigerian university students.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f9fafb",
+  "theme_color": "#7C3AED",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

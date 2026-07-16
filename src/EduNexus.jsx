@@ -172,6 +172,19 @@ async function dbSync(promise, label, toast) {
     return false;
   }
 }
+// Every call to our own /api/* routes that needs to know "who is this" must send
+// the real Supabase session token, not a value we invented client-side (a header
+// like X-User-Id can be edited in devtools and would let anyone spoof identity —
+// see api/quiz.js). The server verifies this token before trusting it.
+async function authHeaders() {
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
 // Click target for the "get unlimited questions" CTA on the quiz panel and in Settings.
 // Swap this for your own ad/landing page URL — it opens in a new tab before the person
 // continues on to actually grab their free key. Defaults to Google AI Studio directly.
@@ -205,6 +218,7 @@ export default function App() {
   const [courses, setCourses] = useState([]);
   const [todos, setTodos] = useState([]);
   const [streak, setStreak] = useState(7);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const [personalKey, setPersonalKey] = useState(() => localStorage.getItem("apex_personal_key") || "");
   const [usePersonalKey, setUsePersonalKey] = useState(() => localStorage.getItem("apex_use_personal_key") === "true");
@@ -262,9 +276,23 @@ export default function App() {
       if (tErr) console.error("Loading todos failed:", tErr.message);
       if (tData) setTodos(tData);
 
+      // Two separate queries on purpose: `is_admin` doesn't exist until the
+      // migration in supabase/migration_admin_analytics.sql is run, and a
+      // missing column makes Postgres reject the *entire* select — bundling
+      // it with `streak` would silently break streak loading for everyone
+      // until they run that migration. Keeping them apart means the admin
+      // check can fail safely without taking the rest of the profile with it.
       const { data: profile, error: pErr } = await supabase.from("edu_profiles").select("streak").eq("id", userId).single();
       if (pErr) console.error("Loading profile failed:", pErr.message);
       if (profile) setStreak(profile.streak);
+
+      try {
+        const { data: adminRow, error: aErr } = await supabase.from("edu_profiles").select("is_admin").eq("id", userId).single();
+        if (aErr) throw aErr;
+        setIsAdmin(!!adminRow?.is_admin);
+      } catch {
+        setIsAdmin(false);
+      }
     } catch (e) {
       console.warn("Supabase integration offline. Falling back to local device memory.", e);
       loadLocalCache();
@@ -299,6 +327,7 @@ export default function App() {
       await supabase.auth.signOut();
     } catch (e) {}
     setUser(null);
+    setIsAdmin(false);
     localStorage.removeItem("apex_active_user");
     setScreen("home");
   };
@@ -349,6 +378,7 @@ export default function App() {
       {screen === "app" && (
         <AppPage 
           user={user} 
+          isAdmin={isAdmin}
           onLogout={handleLogout}
           deadlines={deadlines} setDeadlines={setDeadlines}
           courses={courses} setCourses={setCourses}
@@ -502,7 +532,7 @@ function HomePage({ setScreen, installPrompt, onInstallClick }) {
    WORKSPACE CONSOLE (APP SHELL)
 ═══════════════════════════════════════════════════════════════ */
 function AppPage({
-  user, onLogout,
+  user, isAdmin, onLogout,
   deadlines, setDeadlines,
   courses, setCourses,
   todos, setTodos,
@@ -542,7 +572,8 @@ function AppPage({
     { id: "teaser", label: "Focus Puzzles", icon: <Icons.Teaser /> },
     { id: "streaks", label: "Workspace Lobby", icon: <Icons.Streak /> },
     { id: "activity", label: "System Logs", icon: <Icons.Activity /> },
-    { id: "notifs", label: "Settings", icon: <Icons.Settings /> }
+    { id: "notifs", label: "Settings", icon: <Icons.Settings /> },
+    ...(isAdmin ? [{ id: "admin", label: "Admin Dashboard", icon: <Icons.Shield /> }] : [])
   ];
 
   const urgent = deadlines.filter(d => !d.done && daysLeft(d.due) <= 3).length;
@@ -618,6 +649,7 @@ function AppPage({
         {section === "streaks"   && <SectionStreaks user={user} {...ctx} />}
         {section === "activity"  && <SectionActivity {...ctx} />}
         {section === "notifs"    && <SectionNotifs {...ctx} />}
+        {section === "admin"     && isAdmin && <SectionAdmin {...ctx} />}
       </main>
     </div>
   );
@@ -1108,12 +1140,103 @@ function SectionTodos({ user, todos, setTodos, log, toast, setSection }) {
 /* ═══════════════════════════════════════════════════════════════
    AI DESK: FLASHCARDS & QUIZ GENERATOR (LIVE DUAL-KEY PIPELINE)
 ═══════════════════════════════════════════════════════════════ */
+// Live AI-status card: shows which key is powering generations right now, and
+// (for the shared platform key) how many generations are left today and when
+// the quota resets. Polls /api/usage-status — the only source of truth, since
+// the limit is enforced server-side — so it can't be fooled by local state.
+function AIStatusCard({ usePersonalKey, personalKey, refreshSignal }) {
+  const [status, setStatus] = useState(null);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      const headers = { ...(await authHeaders()) };
+      if (usePersonalKey && personalKey.trim()) headers["X-Gemini-Key-Present"] = "1";
+      try {
+        const res = await fetch("/api/usage-status", { headers });
+        const data = await res.json();
+        if (!cancelled) setStatus(data);
+      } catch {
+        if (!cancelled) setStatus(null);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+  }, [usePersonalKey, personalKey, refreshSignal]);
+
+  // Ticks the "resets in" countdown without an extra network round-trip —
+  // resetAt itself only changes once a day / after a new generation.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (!status) {
+    return (
+      <Card className="p-5 animate-pulse">
+        <div className="h-3 w-28 bg-gray-100 rounded mb-3" />
+        <div className="h-5 w-40 bg-gray-100 rounded" />
+      </Card>
+    );
+  }
+
+  if (status.mode === "personal" || status.unlimited) {
+    return (
+      <Card className="p-5 bg-gradient-to-br from-purple-600 to-purple-700 text-white border-0">
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-[10px] font-bold uppercase tracking-wide text-purple-200">AI Generation</p>
+          <span className="inline-flex items-center gap-1 bg-white/15 text-[10px] font-bold px-2 py-1 rounded-full">
+            <Icons.Check className="w-3 h-3" /> Personal API Active
+          </span>
+        </div>
+        <p className="text-lg font-black">Unlimited Quiz Generation</p>
+        <p className="text-xs text-purple-100 mt-1">Powered by your Gemini API key</p>
+      </Card>
+    );
+  }
+
+  const resetMs = status.resetAt ? new Date(status.resetAt).getTime() - now : 0;
+  const hrs = Math.max(0, Math.floor(resetMs / 3600000));
+  const mins = Math.max(0, Math.floor((resetMs % 3600000) / 60000));
+  const low = status.remaining <= 1;
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between mb-3">
+        <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400">AI Generation</p>
+        <span className="inline-flex items-center gap-1 bg-gray-100 text-gray-600 text-[10px] font-bold px-2 py-1 rounded-full">Platform API</span>
+      </div>
+      <div className="flex items-end justify-between">
+        <div>
+          <p className="text-[10px] font-bold text-gray-400 uppercase mb-1">Remaining Today</p>
+          <p className={`text-2xl font-black ${low ? "text-red-500" : "text-gray-900"}`}>
+            {status.remaining} <span className="text-sm text-gray-400 font-bold">/ {status.limit}</span>
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-[10px] font-bold text-gray-400 uppercase mb-1">Resets In</p>
+          <p className="text-sm font-bold text-gray-700 inline-flex items-center gap-1 justify-end">
+            <Icons.Clock className="w-3.5 h-3.5" /> {hrs}h {mins}m
+          </p>
+        </div>
+      </div>
+      {status.remaining === 0 && (
+        <p className="text-[11px] text-red-500 font-semibold mt-3">
+          Limit reached — add a personal Gemini key in Settings for unlimited generations.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePersonalKey, user }) {
   const [step, setStep] = useState("upload");
   const [mode, setMode] = useState("flashcards");
   const [fileName, setFileName] = useState("");
   const [payload, setPayload] = useState(null);
   const [numQ, setNumQ] = useState(5);
+  const [statusRefresh, setStatusRefresh] = useState(0);
 
   const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
@@ -1193,11 +1316,11 @@ function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePerson
       ? `[session ${seed}] Generate exactly ${numQ} highly randomized, unique multiple-choice questions based on the structural facts of this document. Do not focus on only one section; scan the entire document and pick a different mix of sections/pages than you might on another run. Never ask the user a clarifying question (e.g. which chapter to use) — you must choose the content yourself. Return ONLY a valid raw JSON array containing objects matching this format exactly: {"question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"answer":"A) ..."} (The answer string must match one option exactly). No markdown wrapper, no extra explanations.`
       : `[session ${seed}] Generate exactly ${numQ} highly randomized study flashcards scanning the key concepts, terms, and theories of this document. Ensure deep coverage of different sections, varying which ones you pick from run to run. Never ask the user a clarifying question. Return ONLY a valid raw JSON array matching this format exactly: [{"front":"Concept, question or term","back":"Detailed, clear active recall answer or explanation"}]. No markdown wrapper, no extra text.`;
 
-    const headers = { "Content-Type": "application/json" };
     // Rate limiting per-IP breaks down at scale — many students share one IP on
     // campus wifi / cyber cafes, which would wrongly lump them into one bucket.
-    // Per-account is the reliable key once someone is logged in.
-    if (user?.id) headers["X-User-Id"] = user.id;
+    // Per-account is the reliable key once someone is logged in — and it has to
+    // be the server-verified session token, not a client-editable header.
+    const headers = { "Content-Type": "application/json", ...(await authHeaders()) };
     if (usePersonalKey && personalKey.trim()) {
       headers["X-Gemini-Key"] = personalKey.trim();
     }
@@ -1217,7 +1340,8 @@ function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePerson
         body: JSON.stringify({
           model: "gemini-2.0-flash",
           max_tokens: 3000,
-          messages: messages
+          messages: messages,
+          feature: mode === "quiz" ? "quiz" : "flashcards"
         })
       });
 
@@ -1247,11 +1371,13 @@ function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePerson
         log("quiz", `AI generated Flashcard deck from ${fileName}`, "#7C3AED");
       }
       toast("AI Materials synthesized successfully!", "#10B981");
+      setStatusRefresh(n => n + 1);
 
     } catch (err) {
       console.error("AI Generation failed. Returning fallback.", err);
       toast(`AI generation failed (${err.message}). Using mock fallback.`, "#F59E0B");
-      
+      setStatusRefresh(n => n + 1);
+
       const fallback = getLocalFallback();
       if (mode === "quiz") {
         setQuestions(fallback);
@@ -1301,6 +1427,10 @@ function SectionQuiz({ log, toast, setSection, setStreak, personalKey, usePerson
             Upload Another
           </button>
         )}
+      </div>
+
+      <div className="max-w-xl mx-auto">
+        <AIStatusCard usePersonalKey={usePersonalKey} personalKey={personalKey} refreshSignal={statusRefresh} />
       </div>
 
       {step === "upload" && (
@@ -1712,6 +1842,146 @@ function SectionActivity({ activity, setSection }) {
         ))}
         {activity.length === 0 && <p className="text-xs text-gray-400 text-center">No logs generated this session.</p>}
       </Card>
+    </div>
+  );
+}
+
+// Minimal dependency-free bar chart (no charting library in this project's
+// dependencies, and this environment can't run `npm install` to add one —
+// a plain inline SVG keeps this reliable without introducing an unverified dep).
+function MiniBarChart({ data, valueKey, labelKey, color = "#7C3AED" }) {
+  const max = Math.max(1, ...data.map(d => d[valueKey]));
+  const barW = 100 / data.length;
+  return (
+    <svg viewBox="0 0 100 40" className="w-full h-28" preserveAspectRatio="none">
+      {data.map((d, i) => {
+        const h = (d[valueKey] / max) * 34;
+        return (
+          <g key={i}>
+            <rect
+              x={i * barW + barW * 0.15}
+              y={38 - h}
+              width={barW * 0.7}
+              height={h}
+              fill={color}
+              rx="0.6"
+            >
+              <title>{`${d[labelKey]}: ${d[valueKey]}`}</title>
+            </rect>
+          </g>
+        );
+      })}
+      <line x1="0" y1="38" x2="100" y2="38" stroke="#E5E7EB" strokeWidth="0.5" />
+    </svg>
+  );
+}
+
+const StatTile = ({ label, value, sub }) => (
+  <Card className="p-4">
+    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wide">{label}</p>
+    <p className="text-2xl font-black text-gray-900 mt-1">{value}</p>
+    {sub && <p className="text-[11px] text-gray-400 mt-0.5">{sub}</p>}
+  </Card>
+);
+
+function SectionAdmin({ setSection }) {
+  const [stats, setStats] = useState(null);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setLoading(true);
+      try {
+        const headers = await authHeaders();
+        const res = await fetch("/api/admin-stats", { headers });
+        const data = await res.json();
+        if (cancelled) return;
+        if (!res.ok) {
+          setErr(data.error || "Failed to load admin stats.");
+        } else {
+          setStats(data);
+          setErr("");
+        }
+      } catch (e) {
+        if (!cancelled) setErr("Could not reach the admin stats endpoint.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      <PageHeader onBack={() => setSection("dashboard")} title="Admin Dashboard" />
+
+      {loading && (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Card key={i} className="p-4 animate-pulse">
+              <div className="h-3 w-16 bg-gray-100 rounded mb-3" />
+              <div className="h-6 w-10 bg-gray-100 rounded" />
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {!loading && err && (
+        <Card className="p-6 text-center">
+          <p className="text-sm font-bold text-gray-700">{err}</p>
+          <p className="text-xs text-gray-400 mt-2">
+            If this is your first time here, run the migration in <code>supabase/migration_admin_analytics.sql</code> and confirm your profile has <code>is_admin = true</code>.
+          </p>
+        </Card>
+      )}
+
+      {!loading && !err && stats && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <StatTile label="Total AI Requests" value={stats.totalRequests} sub={`Last ${stats.windowDays} days`} />
+            <StatTile label="Platform API Uses" value={stats.platformRequests} />
+            <StatTile label="Personal API Uses" value={stats.personalRequests} />
+            <StatTile label="Active Users" value={stats.activeUsers} sub={`Last ${stats.windowDays} days`} />
+            <StatTile label="On Platform Key" value={stats.usersOnPlatform} />
+            <StatTile label="On Personal Key" value={stats.usersOnPersonal} />
+          </div>
+
+          <Card className="p-5">
+            <p className="text-xs font-bold text-gray-500 mb-3">Daily AI Generations (last {stats.windowDays} days)</p>
+            {stats.dailyGenerations.every(d => d.count === 0) ? (
+              <p className="text-xs text-gray-400 text-center py-6">No AI activity logged yet in this window.</p>
+            ) : (
+              <MiniBarChart data={stats.dailyGenerations} valueKey="count" labelKey="day" />
+            )}
+          </Card>
+
+          <Card className="p-5">
+            <p className="text-xs font-bold text-gray-500 mb-3">Recent Errors & Rate Limits</p>
+            {stats.errorLogs.length === 0 ? (
+              <p className="text-xs text-gray-400 text-center py-4">No errors logged. 🎉</p>
+            ) : (
+              <div className="space-y-2 max-h-72 overflow-y-auto">
+                {stats.errorLogs.map((e, i) => (
+                  <div key={i} className="flex items-start justify-between gap-3 text-xs border-b border-gray-100 last:border-0 py-2">
+                    <div className="min-w-0">
+                      <p className="font-bold text-gray-700">
+                        {e.feature} · <span className="text-gray-400 font-normal">{e.keyType}</span>
+                        {" "}
+                        <span className={e.status === "rate_limited" ? "text-amber-600" : "text-red-500"}>{e.status}</span>
+                      </p>
+                      {e.message && <p className="text-gray-400 truncate">{e.message}</p>}
+                    </div>
+                    <span className="text-gray-400 shrink-0">{new Date(e.createdAt).toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </>
+      )}
     </div>
   );
 }
